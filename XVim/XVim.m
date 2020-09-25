@@ -1,266 +1,359 @@
-//
-//  XVim.m
 //  XVim
 //
 //  Created by Shuichiro Suzuki on 1/19/12.
 //  Copyright 2012 JugglerShu.Net. All rights reserved.
 //
 
-#import "XVim.h"
-
-
-// HOW TO INSTALL
-// Copy XVim.dylib to ~/Library/Application Support/Developer/Shared/Xcode/Plug-ins
-//                    (Make directory if it does not exist)
-
-// Xcode View hieralchy
+// This is the main class of XVim
+// The main role of XVim class is followings.
+//    - create hooks.
+//    - provide methods used by all over the XVim features.
 //
-//  IDESourceCodeEdiorContainerView
-//           |
-//           |- DVTSourceTextScrollView    <-- enclosingScrollView from DVTSourceView
-//                     |- NSClipView
-//                     |      |- DVTSourceTextView
-//                     |- DVTMarkedScroller <- vertical scrollbar
-//                     |- NSScroller <- horizontal scrollbar
-//                     |- DVTTextSidebarView <- area to display line number or debug point
-//                     
+// Hooks:
+// The plugin entry point is "load" but does little thing.
+// The important method after that is hook method.
+// In this method we create hooks necessary for XVim initializing.
+// The most important hook is hook for IDEEditorArea and DVTSourceTextView.
+// These hook setup command line and intercept key input to the editors.
+//
+// Methods:
+// XVim is a singleton instance and holds objects which can be used by all the features in XVim.
+// See the implementation to know what kind of objects it has. They are not difficult to understand.
+// 
 
+#import "XVim.h"
 #import "Logger.h"
-#import "Hooker.h"
-#import "DVTSourceTextViewHook.h"
-#import "XVimEvaluator.h"
+#import "XVimSearch.h"
+#import "XVimExCommand.h"
+#import "XVimKeymap.h"
+#import "XVimRegister.h"
+#import "XVimKeyStroke.h"
+#import "XVimOptions.h"
+#import "XVimHistoryHandler.h"
+#import "XVimHookManager.h"
+#import "XVimCommandLine.h"
+#import "XVimMarks.h"
+#import "XVimMotion.h"
+#import "XVimTester.h"
+#import "XVimUtil.h"
+#import "IDEKit.h"
+#import "objc/runtime.h"
+#import "DVTSourceTextView+XVim.h"
+#import "XVimStatusLine.h"
+#import "XVimAboutDialog.h"
+
+NSString * const XVimDocumentChangedNotification = @"XVimDocumentChangedNotification";
+NSString * const XVimDocumentPathKey = @"XVimDocumentPathKey";
+
+@interface XVim() {
+	XVimHistoryHandler *_exCommandHistory;
+	XVimHistoryHandler *_searchHistory;
+	XVimKeymap* _keymaps[XVIM_MODE_COUNT];
+    NSFileHandle* _logFile;
+}
+@property (strong,nonatomic) XVimRegisterManager* registerManager;
+@property (strong,nonatomic) XVimMutableString* lastOperationCommands;
+@property (strong,nonatomic) XVimMutableString* tempRepeatRegister;
+- (void)parseRcFile;
+@end
 
 @implementation XVim
-@synthesize tag,mode,cmdLine,sourceView;
 
-+ (void) load { 
-    // Entry Point of the Plugin.
-    // Hook methods ( mainly of DVTSourceTextView" )
-    // The key method "initWithCoder:" and "keyDown:"
-    // See the implementation in "DVTSourceTextViewHook.m" to know
-    // what we are doing in these method hooks.
+// For reverse engineering purpose.
++(void)receiveNotification:(NSNotification*)notification{
+    if( [notification.name hasPrefix:@"IDE"] || [notification.name hasPrefix:@"DVT"] ){
+       TRACE_LOG(@"Got notification name : %@    object : %@", notification.name, NSStringFromClass([[notification object] class]));
+    }
+}
+
++ (NSString*)xvimrc{
+    NSString *homeDir = NSHomeDirectoryForUser(NSUserName());
+    NSString *keymapPath = [homeDir stringByAppendingString: @"/.xvimrc"]; 
+    return [[NSString alloc] initWithContentsOfFile:keymapPath encoding:NSUTF8StringEncoding error:NULL];
+}
+
++ (void)about:(id)sender{
+    XVimAboutDialog* p = [[XVimAboutDialog alloc] initWithWindowNibName:@"about"];
+    NSWindow* win = [p window];
+    [[NSApplication sharedApplication] runModalForWindow:win];
+}
+
+#define XVIM_MENU_TOGGLE_IDENTIFIER @"XVim.Enable";
++ (NSMenuItem*)xvimMenuItem{
+    // Add XVim menu
+    NSMenuItem* item = [[NSMenuItem alloc] init];
+    item.title = @"XVim";
+    NSMenu* m = [[NSMenu alloc] initWithTitle:@"XVim"];
+    [item setSubmenu:m];
     
+    NSMenuItem* subitem = [[NSMenuItem alloc] init];
+    subitem.title = @"Enable";
+    [subitem setEnabled:YES];
+    [subitem setState:NSOnState];
+    subitem.target = [XVim instance];
+    subitem.action = @selector(toggleXVim:);
+    subitem.representedObject = XVIM_MENU_TOGGLE_IDENTIFIER;
+    [m addItem:subitem];
+    
+    subitem = [[NSMenuItem alloc] init];
+    subitem.title = @"About XVim";
+    [subitem setEnabled:YES];
+    subitem.target = [XVim class];
+    subitem.action = @selector(about:);
+    [m addItem:subitem];
+    
+    // Test cases
+    if( [XVim instance].options.debug ){
+        // Add category sub menu
+        NSMenuItem* subm = [[NSMenuItem alloc] init];
+        subm.title = @"Test categories";
+        
+        // Create category menu
+        NSMenu* cat_menu = [[NSMenu alloc] init];
+        // Menu for run all test
+        NSMenuItem* subitem = [[NSMenuItem alloc] init];
+        subitem.title = @"All";
+        subitem.target = [XVim instance];
+        subitem.action = @selector(runTest:);
+        [cat_menu addItem:subitem];
+        [cat_menu addItem:[NSMenuItem separatorItem]];
+        for( NSString* c in [[XVim instance].testRunner categories]){
+            subitem = [[NSMenuItem alloc] init];
+            subitem.title = c;
+            subitem.target = [XVim instance];
+            subitem.action = @selector(runTest:);
+            [subitem setEnabled:YES];
+            [cat_menu addItem:subitem];
+        }
+        [m addItem:subm];
+        [subm setSubmenu:cat_menu];
+    }
+    
+    return item;
+}
+
++ (void) load{
+    NSBundle* app = [NSBundle mainBundle];
+    NSString* identifier = [app bundleIdentifier];
+    
+    // Load only into Xcode
+    if( ![identifier isEqualToString:@"com.apple.dt.Xcode"] ){
+        return;
+    }
+    
+    // Entry Point of the Plugin.
     [Logger defaultLogger].level = LogTrace;
     
-    TRACE_LOG(@"XVim loaded");
-    Class c = NSClassFromString(@"DVTSourceTextView");
+    // This looks strange but this is what intended to.
+    // [XVim instance] part initialize all the internal objects which does not depends on each other
+    // (If some initialization of a object which is held by XVim class(such as XVimSearch) access
+    //  [XVim instance] inside it, it causes dead lock because of dispatch_once in [XVim instance] method.
+    // So after initializing all the independent object we do initialize dependent objects in init2
+    [[XVim instance] init2];
     
-    // Hook initWithCoder:
-    [Hooker hookMethod:@selector(initWithCoder:) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(initWithCoder:) ) keepingOriginalWith:@selector(XVimInitWithCoder:)];
+    //Caution: parseRcFile can potentially invoke +instance on XVim (e.g. if "set ..." is
+    //used in .ximvrc) so we must be sure to call it _AFTER_ +instance has completed
+    [[XVim instance] parseRcFile];
     
-    // Hook viewDidMoveToSuperview
-    [Hooker hookMethod:@selector(viewDidMoveToSuperview) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(viewDidMoveToSuperview) ) keepingOriginalWith:@selector(XVimViewDidMoveToSuperview)];
+    // This is for reverse engineering purpose. Comment this in and log all the notifications named "IDE" or "DVT"
+    // [[NSNotificationCenter defaultCenter] addObserver:[XVim class] selector:@selector(receiveNotification:) name:nil object:nil];
+    
+    // Do the hooking after the App has finished launching,
+    // Otherwise, we may miss some classes.
 
-    // Hook keyDown:
-    [Hooker hookMethod:@selector(keyDown:) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(keyDown:) ) keepingOriginalWith:@selector(XVimKeyDown:)];   
+    // Command line window is not setuped if hook is too late.
+    [XVimHookManager hookWhenPluginLoaded];
+    
+    // We used to observer NSApplicationDidFinishLaunchingNotification to wait for all the classes in Xcode are loaded.
+    // When notification comes we hook some classes so that we do not miss any classes.
+    // But unfortunately the notification often not delivered (I do not know why)
+    // And as far as I test in Xcode 4.6 all the classes(frameworks/plugins) we requre to hook have loaded when this "load" method is called.
+    // So we do not observer it now.
+    // This is related to issue #12
+    // If we need it again (waiting for some classes to be loaded) we probably should use NSBundleDidLoadNotification to know classes our interest
+    // have loaded.
+}
 
-    // Hook performKeyEquivalent:
-    [Hooker hookMethod:@selector(performKeyEquivalent:) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(performKeyEquivalent:)) keepingOriginalWith:@selector(XVimPerformKeyEquivalent:)];
++ (XVim*)instance{
+    static XVim *__instance = nil;
+    static dispatch_once_t __once;
     
-    // Hook drawInsertionPointInRect for Drawing Caret
-    [Hooker hookMethod:@selector(drawInsertionPointInRect:color:turnedOn:) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(drawInsertionPointInRect:color:turnedOn:)) keepingOriginalWith:@selector(XVimDrawInsertionPointInRect:color:turnedOn:)];
-   
-    // Hook _drawInsertionPointInRect for Drawing Caret       
-    [Hooker hookMethod:@selector(_drawInsertionPointInRect:color:) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(_drawInsertionPointInRect:color:)) keepingOriginalWith:@selector(_XVimDrawInsertionPointInRect:color:)];
-    
-    // Hook doCommandBySelector:
-    [Hooker hookMethod:@selector(doCommandBySelector:) ofClass:c withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(doCommandBySelector:)) keepingOriginalWith:@selector(XVimDoCommandBySelector:)];
-    
-    // Hook didAddSubview of DVTSourceTextScrollView
-    [Hooker hookMethod:@selector(didAddSubview:) ofClass:NSClassFromString(@"DVTSourceTextScrollView") withMethod:class_getInstanceMethod([DVTSourceTextViewHook class], @selector(didAddSubview:)) keepingOriginalWith:@selector(XVimDidAddSubview:)];
- 
-    //The foloowing codes helps reverse engineering the instance methods behaviour.
-    //All the instance methods of a class passed to registerTracing are logged when they are called.
-    //Since all the method calls an object of the class are logged
-    //it has impact on the performance.
-    //Comment out if you do not need to trace method calls of the specific classes or specify 
-    // a class name in which you are interested in.
-
-    //[Logger registerTracing:@"DVTSourceTextView"];
-    //[Logger registerTracing:@"DVTTextFinder"];
-    //[Logger registerTracing:@"DVTIncrementalFindBar"];
+    dispatch_once(&__once, ^{
+        // Allocate singleton instance
+        __instance = [[XVim alloc] init];
+        TRACE_LOG(@"XVim loaded");
+    });
+	return __instance;
 }
 
 //////////////////////////////
 // XVim Instance Methods /////
 //////////////////////////////
 
-- (id) initWithFrame:(NSRect)frameRect{
-    self = [super initWithFrame:frameRect];
-    if (self) {
-        mode = MODE_NORMAL;
-        tag = XVIM_TAG;
-        _lastSearchString = [[NSMutableString alloc] init];
+- (id)init {
+	if (self = [super init]) {
+		self.options = [[XVimOptions alloc] init];
         
-        _searchBackword = NO;
-        _currentEvaluator = [[XVimNormalEvaluator alloc] init];
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(addMenuItem:) name:NSApplicationDidFinishLaunchingNotification object:nil];
     }
-    
     return self;
 }
 
--(void)dealloc{
-    [_lastSearchString release];
-    [XVimNormalEvaluator release];
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-- (BOOL)handleKeyEvent:(NSEvent*)event{
-    XVimEvaluator* nextEvaluator = [_currentEvaluator eval:event ofXVim:self];     
-    if( nil == nextEvaluator ){
-        [_currentEvaluator release];
-        _currentEvaluator = [[XVimNormalEvaluator alloc] init];
-    }else{
-        _currentEvaluator = nextEvaluator;
+- (void)init2{
+    _searchHistory = [[XVimHistoryHandler alloc] init];
+    _searcher = [[XVimSearch alloc] init];
+    _lastCharacterSearchMotion = nil;
+    _marks = [[XVimMarks alloc] init];
+    _testRunner= [[XVimTester alloc] init];
+    self.excmd = [[XVimExCommand alloc] init];
+    self.lastPlaybackRegister = nil;
+    self.registerManager = [[XVimRegisterManager alloc] init];
+    self.lastOperationCommands = [[XVimMutableString alloc] init];
+    self.lastVisualPosition = XVimMakePosition(NSNotFound, NSNotFound);
+    self.lastVisualSelectionBegin = XVimMakePosition(NSNotFound, NSNotFound);
+    self.tempRepeatRegister = [[XVimMutableString alloc] init];
+    self.isRepeating = NO;
+    self.isExecuting = NO;
+    self.foundRangesHidden = NO;
+    _logFile = nil;
+    _exCommandHistory = [[XVimHistoryHandler alloc] init];
+    
+    for (int i = 0; i < XVIM_MODE_COUNT; ++i) {
+        _keymaps[i] = [[XVimKeymap alloc] init];
     }
-    NSRange r = [[self sourceView] selectedRange];
-    TRACE_LOG(@"SelectedRange: loc:%d len:%d", r.location, r.length);
-    [self.cmdLine setNeedsDisplay:YES];
-    return YES;
+    
+    [_options addObserver:self forKeyPath:@"debug" options:NSKeyValueObservingOptionNew context:nil];
 }
 
-- (void)commandDetermined:(NSString*)command{
-    NSString* c = [command stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    NSTextView* srcView = [self superview]; // DVTTextSourceView
-    TRACE_LOG(@"command : %@", c);
-    if( [c length] == 0 ){
-        // Something wroing
-        ERROR_LOG(@"command string empty");
-    }
-    else if( [c characterAtIndex:0] == ':' ){
-        // ex commands (is it right?)
-        NSString* ex_command;
-        if( [c length] > 1 ){
-            ex_command = [[c substringFromIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+- (void)addMenuItem:(NSNotification*)notification{
+    // It will fail in Xcode 6.4
+    // Check IDEApplicationController+Xvim.m
+    
+    // Add XVim menu keybinding into keybind preference
+    IDEMenuKeyBindingSet *keyset = [(IDEKeyBindingPreferenceSet*)[[IDEKeyBindingPreferenceSet preferenceSetsManager] currentPreferenceSet] valueForKey:@"_menuKeyBindingSet"];
+    IDEKeyboardShortcut* shortcut = [[IDEKeyboardShortcut alloc] initWithKeyEquivalent:@"x" modifierMask:NSCommandKeyMask|NSShiftKeyMask];
+    IDEMenuKeyBinding *binding = [[IDEMenuKeyBinding alloc] initWithTitle:@"Enable" parentTitle:@"XVim" group:@"XVim" actions:@[ @"toggleXVim:"]  keyboardShortcuts:@[shortcut]];
+    binding.commandIdentifier = XVIM_MENU_TOGGLE_IDENTIFIER;// This must be same as menu items's represented Object.
+    [keyset insertObject:binding inKeyBindingsAtIndex:0];
+    
+    NSMenu *menu = [[NSApplication sharedApplication] menu];
+    
+    NSMenuItem *editorMenuItem = [menu itemWithTitle:@"Editor"];
+    [[editorMenuItem submenu] addItem:[[self class] xvimMenuItem]];
+    
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:NSApplicationDidFinishLaunchingNotification object:nil];
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context{
+    if( [keyPath isEqualToString:@"debug"]) {
+        if( [[XVim instance] options].debug ){
+            NSString *homeDir = NSHomeDirectoryForUser(NSUserName());
+            NSString *logPath = [homeDir stringByAppendingString: @"/.xvimlog"]; 
+            [[Logger defaultLogger] setLogFile:logPath];
         }else{
-            ex_command = @"";
-        }
-        TRACE_LOG(@"EX COMMAND:%@", ex_command);
-        if( [ex_command isEqualToString:@"w"] ){
-            NSWindow *activeWindow = [[NSApplication sharedApplication] mainWindow];
-            NSEvent *keyPress = [NSEvent keyEventWithType:NSKeyDown location:[NSEvent mouseLocation] modifierFlags:NSCommandKeyMask timestamp:[[NSDate date] timeIntervalSince1970] windowNumber:[activeWindow windowNumber] context:[NSGraphicsContext graphicsContextWithWindow:activeWindow] characters:@"s" charactersIgnoringModifiers:@"s" isARepeat:NO keyCode:1];
-            [[NSApplication sharedApplication] sendEvent:keyPress];
-        }
-        else if( [ex_command isEqualToString:@"bn"] ){
-            // Dosen't work as I intend... This switches between tabs but the focus doesnt gose to the DVTSorceTextView after switching...
-            // TODO: set first responder to the new DVTSourceTextView after switching tabs.
-            NSWindow *activeWindow = [[NSApplication sharedApplication] mainWindow];
-            NSEvent *keyPress = [NSEvent keyEventWithType:NSKeyDown location:[NSEvent mouseLocation] modifierFlags:NSCommandKeyMask timestamp:[[NSDate date] timeIntervalSince1970] windowNumber:[activeWindow windowNumber] context:[NSGraphicsContext graphicsContextWithWindow:activeWindow] characters:@"}" charactersIgnoringModifiers:@"}" isARepeat:NO keyCode:1];
-            [[NSApplication sharedApplication] sendEvent:keyPress];
-        }
-        else if( [ex_command isEqualToString:@"bp"] ){
-            // Dosen't work as I intend... This switches between tabs but the focus doesnt gose to the DVTSorceTextView after switching...
-            // TODO: set first responder to the new DVTSourceTextView after switching tabs.
-            NSWindow *activeWindow = [[NSApplication sharedApplication] mainWindow];
-            NSEvent *keyPress = [NSEvent keyEventWithType:NSKeyDown location:[NSEvent mouseLocation] modifierFlags:NSCommandKeyMask timestamp:[[NSDate date] timeIntervalSince1970] windowNumber:[activeWindow windowNumber] context:[NSGraphicsContext graphicsContextWithWindow:activeWindow] characters:@"{" charactersIgnoringModifiers:@"{" isARepeat:NO keyCode:1];
-            [[NSApplication sharedApplication] sendEvent:keyPress];
-        }
-        else if( [ex_command hasPrefix:@"set"] ){
-            if( [ex_command length] > 3 ){
-                NSString* setCommand = [[c substringFromIndex:3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-                if( [setCommand isEqualToString:@"wrap"] ){
-                    [srcView setWrapsLines:YES];
-                }
-                else if( [setCommand isEqualToString:@"nowrap"] ){
-                    [srcView setWrapsLines:NO];
-                }
-            }
-        }
-        else if( [ex_command hasPrefix:@"!"] ){
-            
+            [[Logger defaultLogger] setLogFile:nil];
         }
     }
-    else if( [c characterAtIndex:0] == '/' ){
-        // search
-        _searchBackword = NO;
-        if( [c length] > 1 ){
-            [_lastSearchString setString: [[c substringFromIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]];
-            // I think there should be better solution to handle search action by using XCode features...
-            [self searchNext];
-        }
-    }
-    else if( [c characterAtIndex:0] == '?' ){
-        _searchBackword = YES;
-        if( [c length] > 1 ){
-            [_lastSearchString setString: [[c substringFromIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]];
-            [self searchNext];
-        }
-    }
+}
     
-    [[self window] makeFirstResponder:srcView]; // Since XVim is a subview of DVTSourceTextView;
-    mode = MODE_NORMAL;
+- (void)parseRcFile {
+    NSString* rc = [XVim xvimrc];
+	for (NSString *string in [rc componentsSeparatedByString:@"\n"])
+	{
+		[self.excmd executeCommand:[@":" stringByAppendingString:string] inWindow:nil];
+	}
 }
 
-- (void)searchForward{
-    NSTextView* srcView = [self superview];
-    // get current insert position
-    NSRange r = [srcView selectedRange];
+- (void)writeToConsole:(NSString*)fmt, ...{
     
-    // search text from the index
-    if( [[srcView string] length]-1 > r.location ){
-        NSRange found = [[srcView string] rangeOfString:_lastSearchString options:NSCaseInsensitiveSearch range:NSMakeRange(r.location+1, [[srcView string] length] - r.location - 1)];
-        if( found.location != NSNotFound ){
-            //Move cursor and show the found string
-            [srcView scrollRangeToVisible:found];
-            [srcView showFindIndicatorForRange:found];
-            [srcView setSelectedRange:NSMakeRange(found.location, 0)];
-        }
+    IDEDefaultDebugArea* debugArea = (IDEDefaultDebugArea*)[XVimLastActiveEditorArea() activeDebuggerArea];
+    // On playgorund activateConsole call cause crash.
+    if (![debugArea canActivateConsole]){
+        return;
     }
-
+    [XVimLastActiveEditorArea() activateConsole:self];
+    IDEConsoleArea* console = [debugArea consoleArea];
+    
+    // IDEConsoleArea has IDEConsoleTextView as its view but we do not have public method to access it.
+    // It has the view as instance variable named "_consoleView"
+    // So use obj-c runtime method to get instance varialbe by its name.
+    IDEConsoleTextView* pView = [console valueForKey:@"_consoleView"];
+    
+    va_list argumentList;
+    va_start(argumentList, fmt);
+    NSString* string = [[NSString alloc] initWithFormat:fmt arguments:argumentList];
+    pView.logMode = 1; // I do not know well about this value. But we have to set this to write text into the console.
+    [pView insertText:string];
+    [pView insertNewline:self];
+    va_end(argumentList);
 }
 
-
-- (void)searchBackward{
-    NSTextView* srcView = [self superview];
-    // get current insert position
-    NSRange r = [srcView selectedRange];
-    
-    // search text from the index
-    if( r.location > 0 ){
-        NSRange found = [[srcView string] rangeOfString:_lastSearchString options:NSBackwardsSearch|NSCaseInsensitiveSearch range:NSMakeRange(0, r.location-1)];
-        if( found.location != NSNotFound ){
-            //Move cursor and show the found string
-            [srcView scrollRangeToVisible:found];
-            [srcView showFindIndicatorForRange:found];
-            [srcView setSelectedRange:NSMakeRange(found.location, 0)];
-        }
-    }
-    
+- (XVimKeymap*)keymapForMode:(XVIM_MODE)mode {
+	return _keymaps[(int)mode];
 }
 
+- (XVimHistoryHandler*)exCommandHistory {
+    return _exCommandHistory;
+}
 
-- (void)searchNext{
-    if( _searchBackword){
-        [self searchBackward];
-    }else{
-        [self searchForward];
+- (XVimHistoryHandler*)searchHistory {
+	return _searchHistory;
+}
+
+- (void)appendOperationKeyStroke:(XVimString*)stroke{
+    [self.tempRepeatRegister appendString:stroke];
+}
+
+- (void)fixOperationCommands{
+    if( !self.isRepeating ){
+        [self.lastOperationCommands setString:self.tempRepeatRegister];
+        [self.tempRepeatRegister setString:@""];
     }
-    return;
- }
+}
 
-- (void)searchPrevious{
-    if( _searchBackword){
-        [self searchForward];
-    }else{
-        [self searchBackward];
+- (void)cancelOperationCommands{
+    [self.tempRepeatRegister setString:@""];
+}
+
+- (void)startRepeat{
+    self.isRepeating = YES;
+}
+
+- (void)endRepeat{
+    self.isRepeating = NO;
+}
+
+- (void)ringBell {
+    if (_options.errorbells) {
+        NSBeep();
     }
     return;
 }
 
-- (void)commandCanceled{
-    METHOD_TRACE_LOG();
-    mode = MODE_NORMAL;
-    [[self window] makeFirstResponder:[self superview]]; // Since XVim is a subview of DVTSourceTextView;
+- (void)runTest:(id)sender{
+    NSMenuItem* m = sender;
+    if( [m.title isEqualToString:@"All"] ){
+        [self.testRunner selectCategories:self.testRunner.categories];
+    }else{
+        NSMutableArray* arr = [[NSMutableArray alloc] init];
+        [arr addObject:m.title];
+        [self.testRunner selectCategories:arr];
+    }
+    [self.testRunner runTest];
 }
 
-- (void)commandModeWithFirstLetter:(NSString*)first{
-    mode = MODE_CMDLINE;
-    [self cmdLine].mode = MODE_STRINGS[mode];
-    [[self cmdLine] setFocusOnCommandWithFirstLetter:first];
-}
-
-
-- (NSString*)modeName{
-    return MODE_STRINGS[self.mode];
+- (void)toggleXVim:(id)sender{
+    if( [(NSCell*)sender state] == NSOnState ){
+        [DVTSourceTextView xvim_finalize];
+        [(NSCell*)sender setState:NSOffState];
+    }else{
+        [DVTSourceTextView xvim_initialize];
+        [(NSCell*)sender setState:NSOnState];
+    }
 }
 
 @end

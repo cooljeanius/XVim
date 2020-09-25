@@ -7,15 +7,25 @@
 //
 
 #import "Logger.h"
-#import "Hooker.h"
 #import <objc/runtime.h>
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
+#import "DVTKit.h"
 
 #define LOGGER_DEFAULT_NAME @"LoggerDefaultName"
+
 static Logger* s_defaultLogger = nil;
+
+
+@interface Logger(){
+    NSFileHandle* _logFile;
+}
+@end
+
 
 @implementation Logger
 @synthesize level,name;
+
 + (Logger*) defaultLogger{
     if( s_defaultLogger == nil ){
 #ifdef DEBUG
@@ -27,11 +37,9 @@ static Logger* s_defaultLogger = nil;
     return s_defaultLogger;
 }
 
-
-
 - (void) forwardInvocationForLogger:(NSInvocation*) invocation{
     NSString* selector = NSStringFromSelector([invocation selector]);
-    NSString* forward = [[[NSString alloc] initWithFormat:@"LOGGER_HIDDEN_%@", NSStringFromSelector([invocation selector]) ] autorelease];
+    NSString* forward = [[NSString alloc] initWithFormat:@"LOGGER_HIDDEN_%@", NSStringFromSelector([invocation selector]) ];
     if( [[invocation target] respondsToSelector:NSSelectorFromString(forward)] ){
         [Logger logWithLevel:LogTrace format:@"ENTER METHOD - %@ %@", NSStringFromClass([self class]), selector];
         [invocation setSelector:NSSelectorFromString(forward)];
@@ -55,10 +63,13 @@ static Logger* s_defaultLogger = nil;
     }
     unsigned int num;
     Method* m = class_copyMethodList(c, &num);    
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundeclared-selector"
     IMP no_imp = class_getMethodImplementation([Logger class], @selector(there_is_not_such_method)); // Find imple for not implemented
+#pragma clang diagnostic pop
     for( unsigned int i = 0 ; i < num ; i++ ){
         SEL selector = method_getName(m[i]);
-        NSString* new_selector = [[[NSString alloc] initWithFormat:@"LOGGER_HIDDEN_%@", NSStringFromSelector(selector)] autorelease];
+        NSString* new_selector = [[NSString alloc] initWithFormat:@"LOGGER_HIDDEN_%@", NSStringFromSelector(selector)];
         class_addMethod(c, NSSelectorFromString(new_selector), method_getImplementation(m[i]), method_getTypeEncoding(m[i]));
         method_setImplementation(m[i], no_imp);
     }
@@ -66,12 +77,10 @@ static Logger* s_defaultLogger = nil;
     // Set forwardInvocation:
     Method myinv = class_getClassMethod([Logger class], @selector(forwardInvocationForLogger:));
     class_addMethod(c, @selector(forwardInvocation:), class_getMethodImplementation([Logger class], @selector(forwardInvocationForLogger:)), method_getTypeEncoding(myinv));
-    
 }
 
 
-- (id)init
-{
+- (id)init {
     return [self initWithName:LOGGER_DEFAULT_NAME];
 }
 
@@ -88,31 +97,36 @@ static Logger* s_defaultLogger = nil;
 }
 
 - (void) write:(NSString*)fmt :(va_list)args{
-    NSLogv(fmt, args);
+    va_list args2;
+    va_copy(args2, args);
+    
+    // Write to stderr
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:args];
+    printf("%s\n", [[s stringByReplacingOccurrencesOfString:@"%%" withString:@"%%%%"] UTF8String]);
+    
+    // Write to file
+    if( nil != _logFile) {
+        NSString* msg = [[NSString alloc] initWithFormat:fmt arguments:args2];
+        [_logFile writeData:[msg dataUsingEncoding:NSUTF8StringEncoding]];
+        [_logFile writeData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    }
+    
+    va_end(args2);
 }
-
-
 
 - (void) logWithLevel:(LogLevel)l format:(NSString *)format :(va_list)args{
     if ( l < self.level ){
         return;
     }
-    NSString* fmt;
-    switch(l){
-        case LogTrace:
-            fmt = [NSString stringWithFormat:@"[Trace]%@", format];
-            break;
-        case LogDebug:
-            fmt = [NSString stringWithFormat:@"[Debug]%@", format];
-            break;
-        case LogError:
-            fmt = [NSString stringWithFormat:@"[Error]%@", format];
-            break;
-        case LogFatal:
-            fmt = [NSString stringWithFormat:@"[Fatal]%@", format];
-            break;
-            
+    NSDictionary* logLevelNames = @{ @(LogTrace):@"Trace", @(LogDebug):@"Debug",
+                                     @(LogError):@"Error", @(LogFatal):@"Fatal"};
+    static NSDateFormatter* s_formatter = nil;
+    if( s_formatter == nil ){
+        s_formatter = [[NSDateFormatter alloc] init];
+        [s_formatter setDateFormat:@"HH:mm:ss:SSS"];
     }
+    NSString *sNow = [s_formatter stringFromDate:[NSDate date]];
+    NSString* fmt = [NSString stringWithFormat:@"[%@][%@]%@", logLevelNames[@(l)], sNow, format];
     [self write:fmt :args];
 }
 
@@ -131,8 +145,28 @@ static Logger* s_defaultLogger = nil;
      va_end(argumentList); 
 }
 
-+ (void) traceMethodList:(NSString*)class{
+- (void) setLogFile:(NSString *)path{
+    [_logFile closeFile];
+    _logFile = nil;
     
+    if( nil != path){
+        NSFileManager* fm = [NSFileManager defaultManager];
+        if( ![fm fileExistsAtPath:path] ){
+            [fm createFileAtPath:path contents:nil attributes:nil];
+        }
+        _logFile = [NSFileHandle fileHandleForWritingAtPath:path]; // Do we need to retain this? I want to use this handle as long as Xvim is alive.
+        [_logFile seekToEndOfFile];
+    }
+    
+}
+
++ (void) logStackTrace:(NSException*)ex{
+    for( NSString* e in [ex callStackSymbols]){
+        TRACE_LOG(@"%@", e);
+    }
+}
+
++ (void) traceMethodList:(NSString*)class{
     Class c = NSClassFromString(class);
     if( nil == c ){
         DEBUG_LOG(@"Can't find class : %@", class);
@@ -142,7 +176,7 @@ static Logger* s_defaultLogger = nil;
     Method* m = class_copyMethodList(c, &num);    
     TRACE_LOG(@"METHOD LIST : %@", class);
     for( unsigned int i = 0 ; i < num ; i++ ){
-        SEL selector = method_getName(m[i]);
+        SEL selector __unused = method_getName(m[i]);
         TRACE_LOG(@"%@", NSStringFromSelector(selector) );
     }
 }
@@ -152,10 +186,10 @@ static Logger* s_defaultLogger = nil;
     Class * classes = NULL;
     
     numClasses = objc_getClassList(NULL, 0);
-    NSMutableString* text = [[[NSMutableString alloc] init ] autorelease];
+    NSMutableString* text = [[NSMutableString alloc] init ];
     if (numClasses > 0 )
     {
-        classes = malloc(sizeof(Class) * numClasses);
+        classes = (Class*)malloc(sizeof(Class) * (NSUInteger)numClasses);
         numClasses = objc_getClassList(classes, numClasses);
         // Enumerate Classes
         for( int i = 0 ; i < numClasses ; i++ ){
@@ -171,7 +205,7 @@ static Logger* s_defaultLogger = nil;
             [text appendString:@"\n"];
             unsigned int num;
             Method* m = class_copyMethodList(classes[i], &num);
-            for( int j = 0 ; j < num; j++ ){
+            for( NSUInteger j = 0 ; j < num; j++ ){
                 NSString* methodName = NSStringFromSelector(method_getName(m[j]));
                 [text appendFormat:@"<li>%@</li>\n",methodName];
                 //[Logger logWithLevel:l format:@"    %@",NSStringFromSelector(method_getName(m[j]))];
@@ -191,8 +225,8 @@ static Logger* s_defaultLogger = nil;
 
 + (void) traceViewInfoImpl:(NSView*)obj subView:(BOOL)sub prefix:(NSString*)pre{
     NSString* className = NSStringFromClass([obj class]);
-    NSRect f = obj.frame;
-    NSRect b = obj.bounds;
+    NSRect f __unused = obj.frame;
+    NSRect b __unused = obj.bounds;
     TRACE_LOG(@"%@ViewInfo : Class:%@ frame:%f,%f,%f,%f bounds:%f,%f,%f,%f", pre, className, f.origin.x, f.origin.y, f.size.width, f.size.height, b.origin.x, b.origin.y, b.size.width, b.size.height);
 
     if( sub ){
@@ -206,7 +240,38 @@ static Logger* s_defaultLogger = nil;
     [Logger traceViewInfoImpl:obj subView:sub prefix:@""];
 }
 
-+ (void) inspectClass:(Class)cls{
-    
+
++ (void)traceView:(NSView*)view depth:(NSUInteger)depth{
+    NSMutableString* str = [[NSMutableString alloc] init];
+    for( NSUInteger i = 0 ; i < depth; i++ ){
+        [str appendString:@"   "];
+    }
+    [str appendString:@"%p:%@ (Tag:%d)"];
+    if( [view isKindOfClass:NSClassFromString(@"DVTControllerContentView")]){
+        [str appendFormat:@" <--- %@", [(DVTControllerContentView*)view viewController].description];
+    }
+    NSLog(str, view, NSStringFromClass([view class]), [view tag]); 
+    for(NSView* v in [view subviews] ){
+        [self traceView:v depth:depth+1];
+    }
+}
+
+
++ (void)traceMenu:(NSMenu*)menu :(int)depth{
+    NSMutableString* tabs = [[NSMutableString alloc] init];
+    for( int i = 0 ; i < depth; i++ ){
+        [tabs appendString:@"\t"];
+    }
+    for(NSMenuItem* item in [menu itemArray] ){
+        if( ![item isSeparatorItem]  ){
+            TRACE_LOG(@"%@Title:%@    Action:%@", tabs, [item title], NSStringFromSelector([item action]));
+        }
+        [Logger traceMenu:[item submenu] :depth+1];
+    }
+}
+
++ (void)traceMenu:(NSMenu*)menu{
+    TRACE_LOG(@"Tracing menu items in menu(%p)", menu);
+    [Logger traceMenu:menu :0];
 }
 @end

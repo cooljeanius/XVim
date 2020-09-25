@@ -8,162 +8,383 @@
 
 #import "XVimCommandLine.h"
 #import "XVimCommandField.h"
+#import "XVimQuickFixView.h"
 #import "Logger.h"
-#import "XVim.h"
+#import "XVimWindow.h"
+#import "DVTKit.h"
+#import "NSAttributedString+Geometrics.h"
+#import <objc/runtime.h>
 
-#define STATUS_BAR_HEIGHT 18
+@interface XVimCommandLine() {
+@private
+    XVimCommandField* _command;
+    NSTextField* _static;
+    NSTextField* _error;
+    NSTextField* _argument;
+
+    XVimQuickFixView* _quickFixScrollView;
+    id _quickFixObservation;
+    NSTimer* _errorTimer;
+}
+@end
 
 @implementation XVimCommandLine
-@synthesize tag,xvim,mode;
 
+-(void)updateFontAndColors{
+        NSColor* textColor = [NSColor textColor];
+        NSFont* textFont = [NSFont systemFontOfSize:[NSFont systemFontSize]];
+        NSColor* textBackgroundColor = [NSColor textBackgroundColor]; 
+        DVTFontAndColorTheme* theme = [NSClassFromString(@"DVTFontAndColorTheme") performSelector:@selector(currentTheme)];
+        if( nil != theme ){
+            textColor = [theme sourcePlainTextColor];
+            textFont = [theme sourcePlainTextFont];
+            textBackgroundColor = [theme sourceTextBackgroundColor];
+        }
+        [_static setFont:textFont];
+        [_static setTextColor:textColor];
+        [_static invalidateIntrinsicContentSize];
+    
+        [_command setFont:textFont];
+        [_command setTextColor:textColor];
+        [_command setBackgroundColor:textBackgroundColor];
+        [_command invalidateIntrinsicContentSize];
+    
+        [_argument setFont:textFont];
+        [_argument setTextColor:textColor];
+        [_argument invalidateIntrinsicContentSize];
+    
+        [_error setFont:textFont];
+        [_error setTextColor:textColor];
+        [_error setBackgroundColor:textBackgroundColor];
+        [_error invalidateIntrinsicContentSize];
+    
+        [self invalidateIntrinsicContentSize];
+}
 
-- (id)init{
-    self = [super initWithFrame:NSMakeRect(0, 0, 0, STATUS_BAR_HEIGHT)];
+- (id)init
+{
+    self = [super init];
     if (self) {
-        // Command View
+        // Static Message ( This is behind the command view if the command is active)
+        _static = [[NSTextField alloc] init];
+        [_static setEditable:NO];
+        [_static setSelectable:NO];
+        [_static setBackgroundColor:[NSColor clearColor]];
+        [_static setHidden:NO];
+        [_static setBordered:NO];
+        [_static setTranslatesAutoresizingMaskIntoConstraints:NO];
+        // Width (fill the command line)
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_static 
+                                                         attribute:NSLayoutAttributeWidth 
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeWidth 
+                                                        multiplier:1.0
+                                                          constant:0.0]];
+        // Left edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_static 
+                                                         attribute:NSLayoutAttributeLeft
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeLeft
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Top edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_static 
+                                                         attribute:NSLayoutAttributeTop
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeTop
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Bottom edge (Superview's bottom is greater than _static bottom)
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_static
+                                                         attribute:NSLayoutAttributeBottom
+                                                         relatedBy:NSLayoutRelationLessThanOrEqual
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeBottom
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        [self addSubview:_static];
+
+        // Error Message
+        _error = [[NSTextField alloc] init];
+        [_error setEditable:NO];
+        [_error setSelectable:NO];
+        [_error setBackgroundColor:[NSColor redColor]];
+        [_error setHidden:YES];
+        [_error setBordered:NO];
+        [_error setTranslatesAutoresizingMaskIntoConstraints:NO];
+        // Width
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_error
+                                                         attribute:NSLayoutAttributeWidth 
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeWidth 
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Left edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_error
+                                                         attribute:NSLayoutAttributeLeft
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeLeft
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Top edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_error
+                                                         attribute:NSLayoutAttributeTop
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeTop
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Bottom edge 
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_error
+                                                         attribute:NSLayoutAttributeBottom
+                                                         relatedBy:NSLayoutRelationLessThanOrEqual
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeBottom
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
         
-        _command = [[XVimCommandField alloc] initWithFrame:NSMakeRect(0, 0, 0, STATUS_BAR_HEIGHT)];
-        _command.delegate = self;
-        [_command setBackgroundColor:[NSColor colorWithSRGBRed:0 green:0 blue:0 alpha:0.0]];
-        _command.stringValue = @"";
+        [self addSubview:_error];
+        
+        
+        // TODO: QuickFix view(height) doesn't show properly now
+        // Quickfix View
+        _quickFixScrollView = [[XVimQuickFixView alloc] init];
+        [_quickFixScrollView setHidden:YES];
+        [_quickFixScrollView setTranslatesAutoresizingMaskIntoConstraints:NO];
+        // Width
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_quickFixScrollView
+                                                         attribute:NSLayoutAttributeWidth 
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeWidth 
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Left edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_quickFixScrollView
+                                                         attribute:NSLayoutAttributeLeft
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeLeft
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Top edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_quickFixScrollView
+                                                         attribute:NSLayoutAttributeTop
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeTop
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Bottom edge (Superview's bottom is greater than _command bottom)
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_quickFixScrollView
+                                                         attribute:NSLayoutAttributeBottom
+                                                         relatedBy:NSLayoutRelationEqual
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeBottom
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+       [self addSubview:_quickFixScrollView];
+        
+
+        
+        // Command View
+        _command = [[XVimCommandField alloc] init];
         [_command setEditable:NO];
-        [_command setBordered:NO];
-        [[_command cell] setFocusRingType:NSFocusRingTypeNone];
-        [_command setFont:[NSFont fontWithName:@"Courier" size:[NSFont systemFontSize]]];
+        [_command setSelectable:NO];
+        [_command setHidden:YES];
+        [_command setTranslatesAutoresizingMaskIntoConstraints:NO];
+        // Width
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_command
+                                                         attribute:NSLayoutAttributeWidth 
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeWidth 
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Left edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_command
+                                                         attribute:NSLayoutAttributeLeft
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeLeft
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Top edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_command
+                                                         attribute:NSLayoutAttributeTop
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeTop
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Bottom edge (Superview's bottom is greater than _command bottom)
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_command
+                                                         attribute:NSLayoutAttributeBottom
+                                                         relatedBy:NSLayoutRelationLessThanOrEqual
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeBottom
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
         [self addSubview:_command];
         
-        // Status View
-        NSMutableParagraphStyle* paragraph = [[[NSMutableParagraphStyle alloc] init] autorelease];
-        [paragraph setAlignment:NSRightTextAlignment];
-        [paragraph setTailIndent:-10.0];
-        _status = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 0, STATUS_BAR_HEIGHT)];
-        [_status setBackgroundColor:[NSColor colorWithSRGBRed:0 green:0 blue:0 alpha:0.0]];
-        _status.stringValue = MODE_STRINGS[((XVim*)xvim).mode]; 
-        [_status setAlignment:NSRightTextAlignment];
-        [_status setEditable:NO];
-        [_status setBordered:NO];
-        [_status setSelectable:NO];
-        [[_status cell] setFocusRingType:NSFocusRingTypeNone];
-        [self addSubview:_status];
+		// Argument View
+        _argument = [[NSTextField alloc] init];
+        [_argument setEditable:NO];
+        [_argument setSelectable:NO];
+        [_argument setBackgroundColor:[NSColor clearColor]];
+        [_argument setHidden:NO];
+        [_argument setBordered:NO];
+        // TODO: Text alignment here doesn't work as I expected.
+        // I want to show the latest input even when the argument string exceeds the max width of the field
+        // but now it only shows head of arguments
+        [_argument setAlignment:NSRightTextAlignment]; //
+        [_argument setTranslatesAutoresizingMaskIntoConstraints:NO];
+        
+        // Right edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_argument
+                                                         attribute:NSLayoutAttributeRight
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeRight
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Top edge
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_argument
+                                                         attribute:NSLayoutAttributeTop
+                                                         relatedBy:NSLayoutRelationEqual 
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeTop
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        // Width limitation (half of command line)
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_argument
+                                                         attribute:NSLayoutAttributeWidth
+                                                         relatedBy:NSLayoutRelationLessThanOrEqual
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeWidth
+                                                        multiplier:0.5 
+                                                          constant:0.0]];
+        // Bottom edge (Superview's bottom is greater than _argument bottom)
+        [self addConstraint:[NSLayoutConstraint constraintWithItem:_argument
+                                                         attribute:NSLayoutAttributeBottom
+                                                         relatedBy:NSLayoutRelationLessThanOrEqual
+                                                            toItem:self 
+                                                         attribute:NSLayoutAttributeBottom
+                                                        multiplier:1.0 
+                                                          constant:0.0]];
+        
+        [self addSubview:_argument];
+
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(fontAndColorSourceTextSettingsChanged:) name:@"DVTFontAndColorSourceTextSettingsChangedNotification" object:nil];
+        
+        [self updateFontAndColors];
     }
     return self;
 }
 
-- (void)dealloc{
-    [_command release];
-    [super dealloc];
-}
-
-// Layout our statusbar in DVTSourceTextScrollView
-// TODO: This process may be done in viewDidEndLiveResize of DVTSourceTextScrollView
-// We can override the method and after the original method, we can relayout the subviews.
-- (void)layoutDVTSourceTextScrollViewSubviews:(NSScrollView*) view{
-    NSRect frame = [view frame];
-    frame.size.width -= 35;
-    [_command setFrameSize:NSMakeSize(frame.size.width/2, STATUS_BAR_HEIGHT)];
-    [_command setFrameOrigin:NSMakePoint(10, 0)];
-    [_status setFrameSize:NSMakeSize(frame.size.width/2-20, STATUS_BAR_HEIGHT)];
-    [_status setFrameOrigin:NSMakePoint(frame.size.width/2,0)];
-    
-    NSScrollView* parent = view;
-    NSArray* views = [parent subviews];
-   
-    for( NSView* v in views ){
-        NSString* viewClass = NSStringFromClass([v class]);
-        NSRect r = [v frame];
-        // layout subviews in DVTSourceScrollTextView
-
-        if( [viewClass isEqualToString:@"NSScroller"] &&  r.size.width > r.size.height){
-            // There is not officail way to detect its horizontal or vertical scroller. ( It looks that NSScroller has hidden flag like "sFlag.isHoriz" )
-            // Horizontal Scroller
-            //r.origin.y = parentRect.size.height - r.size.height - STATUS_BAR_HEIGHT;
-            //[v setFrame:r];
-            //[v setNeedsDisplay:YES];
-        }
-        else if( [viewClass isEqualToString:@"XVimCommandLine"] ){
-            NSRect bounds = [parent bounds];
-            NSRect barFrame = bounds;
-            //barFrame.origin.y = bounds.origin.y + bounds.size.height -STATUS_BAR_HEIGHT;
-            //barFrame.size.height = STATUS_BAR_HEIGHT;
-            
-            barFrame.origin.y = bounds.origin.y + bounds.size.height -STATUS_BAR_HEIGHT-12;
-            barFrame.origin.x = 28; // TODO Get DVTTextSidebarView width to specify correct value
-            barFrame.size.width = bounds.size.width - 20 -28;
-            barFrame.size.height = STATUS_BAR_HEIGHT;
-            [v setFrame:barFrame];
-        }
-        else{
-            //r.size.height = parentRect.size.height - STATUS_BAR_HEIGHT;
-            //[v setFrame:r];
-        }
-    }
-}
-
-- (void)viewWillDraw{
-    [self layoutDVTSourceTextScrollViewSubviews:[self superview]];
-    [super viewWillDraw];
-}
-
-- (void)drawRect:(NSRect)dirtyRect{
-    [_status setStringValue:[xvim modeName]];
-    NSColor* color;
-    if( [_command.stringValue isEqualToString:@""] ){
-        color = [NSColor colorWithSRGBRed:0 green:0.0 blue:0.0 alpha:0.0];
-        [_status setTextColor:[NSColor blackColor]];
-
-    }else{
-        color = [NSColor colorWithSRGBRed:0 green:0.0 blue:0.0 alpha:0.6];
-        [_command setTextColor:[NSColor whiteColor]];
-        [_status setTextColor:[NSColor whiteColor]];
-    }
-    [color set];
-    NSBezierPath* path= [NSBezierPath bezierPathWithRect:dirtyRect];
-    [path fill];
+-(void)drawRect:(NSRect)dirtyRect{
+    DVTFontAndColorTheme* theme = [NSClassFromString(@"DVTFontAndColorTheme") performSelector:@selector(currentTheme)];
+    // set any NSColor for filling, say white:
+    [[theme sourceTextBackgroundColor] setFill];
+    NSRectFill(dirtyRect);
     [super drawRect:dirtyRect];
 }
 
-- (void)didFrameChanged:(NSNotification*)notification{
-    [self layoutDVTSourceTextScrollViewSubviews:[notification object]];
-    [self setNeedsDisplay:YES];
+-(void)dealloc
+{
+    [[ NSNotificationCenter defaultCenter ] removeObserver:self name:@"DVTFontAndColorSourceTextSettingsChangedNotification" object:nil];
+    [[ NSNotificationCenter defaultCenter ] removeObserver:_quickFixObservation];
 }
 
-- (void)didClipViewFrameChanged:(NSNotification*)notification{
+- (void)errorMsgExpired
+{
+    [_error setHidden:YES];
 }
 
-- (void)setFocusOnCommandWithFirstLetter:(NSString*)first{
-    [_command setEditable:YES];
-    [[self window] makeFirstResponder:_command];
-    _command.stringValue = first;
-    NSText* textEditor = [[self window] fieldEditor:YES forObject:_command];
-    [textEditor moveToEndOfLine:self];
+- (void)setModeString:(NSString*)string
+{
+    [_static setStringValue:string];
 }
 
-- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)command{
-    TRACE_LOG(@"Command : %@", NSStringFromSelector(command));
-    if( @selector(insertNewline:) == command ){
-        [xvim commandDetermined:[_command stringValue]];
-        return YES;
-    }else if( @selector(complete:) == command || @selector(cancelOperation:) == command){
-        [xvim commandCanceled];
-        return YES;
-    }else if( @selector(deleteBackward:) ){
-        if( 1 == [[_command stringValue] length] ){
-            return YES;
-        }
+- (void)setArgumentString:(NSString*)string{
+    if(nil != string){
+        [_argument setStringValue:string];
     }
-    return NO; 
+}
+/**
+ * (BOOL)aRedColorSetting
+ *      YES: red color background
+ *      NO : default color background
+ */
+- (void)errorMessage:(NSString*)string Timer:(BOOL)aTimer RedColorSetting:(BOOL)aRedColorSetting
+{
+    DVTFontAndColorTheme* theme = [NSClassFromString(@"DVTFontAndColorTheme") performSelector:@selector(currentTheme)];
+    if( aRedColorSetting ){
+        _error.backgroundColor = [NSColor redColor];
+    } else {
+        _error.backgroundColor = [theme sourceTextBackgroundColor];
+    }
+	NSString* msg = string;
+	if( [msg length] != 0 ){
+		[_error setStringValue:msg];
+		[_error setHidden:NO];
+		[_errorTimer invalidate];
+        if( aTimer ){
+            
+            _errorTimer = [NSTimer timerWithTimeInterval:3.0 target:self selector:@selector(errorMsgExpired) userInfo:nil repeats:NO];
+            [[NSRunLoop currentRunLoop] addTimer:_errorTimer forMode:NSDefaultRunLoopMode];
+        }
+	}else{
+		[_errorTimer invalidate];
+		[_error setHidden:YES];
+	}
 }
 
-- (void)controlTextDidEndEditing:(NSNotification *)aNotification{
-    METHOD_TRACE_LOG();  
-    _command.stringValue = @"";
-    [_command setEditable:NO];
-    ((XVim*)xvim).mode = MODE_NORMAL;
-    
+static NSString* QuickFixPrompt = @"\nPress a key to continue...";
+
+-(void)quickFixWithString:(NSString*)string completionHandler:(void(^)(void))completionHandler
+{
+	if( string && [string length] != 0 ){
+        // Set up observation to close the quickfix window when a key is pressed, or it loses focus
+        __weak XVimCommandLine* this = self;
+        void (^completionHandlerCopy)(void) = [completionHandler copy];
+        _quickFixObservation = [ [ NSNotificationCenter defaultCenter ] addObserverForName:XVimNotificationQuickFixDidComplete
+                                                             object:_quickFixScrollView
+                                                              queue:nil
+                                                         usingBlock:^(NSNotification *note) {
+                                                             [this quickFixWithString:nil completionHandler:completionHandlerCopy ];
+                                                         }];
+        [ _quickFixScrollView setString:string withPrompt:QuickFixPrompt];
+		[ _quickFixScrollView setHidden:NO ];
+        [[_quickFixScrollView window] performSelector:@selector(makeFirstResponder:) withObject:_quickFixScrollView.textView afterDelay:0 ];
+        [_quickFixScrollView.textView performSelector:@selector(scrollToEndOfDocument:) withObject:self afterDelay:0 ];
+	}else{
+        [[ NSNotificationCenter defaultCenter ] removeObserver:_quickFixObservation];
+        [ _quickFixScrollView setString:@"" withPrompt:@""];
+        _quickFixObservation = nil;
+        [_quickFixScrollView setHidden:YES];
+        if (completionHandler) { completionHandler(); }
+	}
 }
 
-- (void)controlTextDidBeginEditing:(NSNotification *)aNotification{
-    METHOD_TRACE_LOG();  
+-(NSUInteger)quickFixColWidth
+{
+    return _quickFixScrollView.colWidth;
+}
+
+- (XVimCommandField*)commandField
+{
+	return _command;
+}
+
+- (void)fontAndColorSourceTextSettingsChanged:(NSNotification*)notification{
+    [self updateFontAndColors];
+    [self setNeedsDisplay:YES];
 }
 
 @end

@@ -7,19 +7,15 @@
 //
 
 #import <AppKit/AppKit.h>
-@class XVimCommandField;
+#import "XVimCommandField.h"
 
-@interface XVimCommandLine : NSView  <NSTextFieldDelegate>{
-    XVimCommandField* _command;
-    NSTextField* _status;
-}
-@property NSInteger tag;
-@property(retain) id xvim;
-@property(retain) NSString* mode;
+@interface XVimCommandLine : NSView
 
-- (void)layoutDVTSourceTextScrollViewSubviews:(NSScrollView*) view;
-- (void)didFrameChanged:(NSNotification*)notification;
-- (void)setFocusOnCommandWithFirstLetter:(NSString*)first;
-
-
+- (id)init;
+- (void)setModeString:(NSString*)string;
+- (void)setArgumentString:(NSString*)string;
+- (void)errorMessage:(NSString*)string Timer:(BOOL)aTimer RedColorSetting:(BOOL)aRedColorSetting;
+- (void)quickFixWithString:(NSString*)string completionHandler:(void(^)(void))completionHandler;
+- (NSUInteger)quickFixColWidth;
+- (XVimCommandField*)commandField;
 @end

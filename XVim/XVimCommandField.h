@@ -7,8 +7,13 @@
 //
 
 #import <AppKit/AppKit.h>
-@interface XVimCommandField : NSTextField {
-@private
-}
+#import "NSInsetTextView.h"
 
+@class XVimKeyStroke;
+@class XVimWindow;
+@class XVimCommandField;
+
+@interface XVimCommandField : NSTextView
+- (void)setDelegate:(XVimWindow*)delegate;
+- (void)handleKeyStroke:(XVimKeyStroke*)keyStroke inWindow:(XVimWindow*)window;
 @end
